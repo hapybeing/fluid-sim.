@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>WebGL2 Real-Time Fluid Simulation</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <title>Cinematic Fluid Simulation</title>
     <style>
         body, html { margin: 0; padding: 0; width: 100vw; height: 100vh; overflow: hidden; background: #000; touch-action: none; }
         canvas { width: 100%; height: 100%; display: block; }
@@ -19,20 +19,19 @@
         const gl = canvas.getContext('webgl2', { antialias: false, depth: false, stencil: false, alpha: false });
         if (!gl) throw new Error('WebGL2 not supported');
         
-        // CRITICAL MOBILE FIXES: Explicitly request half-float filtering extensions
+        // Force mobile GPU compatibility for high-precision textures
         gl.getExtension('EXT_color_buffer_float');
+        gl.getExtension('EXT_color_buffer_half_float');
         gl.getExtension('OES_texture_float_linear');
         gl.getExtension('OES_texture_half_float_linear'); 
 
-        // Simulation parameters
-        const SIM_RES = 256; // Slightly lowered for mobile stability, still looks great
+        const SIM_RES = 256; 
         const DYE_RES = 1024;
-        const ITERATIONS = 30; // Pressure solver iterations
-        const VISCOSITY = 0.0005;
-        const VORTICITY = 15.0;
-        const DISSIPATION = 0.99; // Dye fade
+        const ITERATIONS = 35; // Bumped up for smoother rolling clouds
+        const VISCOSITY = 0.0003; // Slightly lowered so it flows further
+        const VORTICITY = 20.0; // Higher curl for more chaotic, smoky swirls
+        const DISSIPATION = 0.992; // Slightly longer fade
 
-        // --- Shaders ---
         const baseVS = `#version 300 es
         precision highp float;
         out vec2 vUv;
@@ -180,11 +179,14 @@
         uniform sampler2D uTexture;
         void main() {
             vec3 c = texture(uTexture, vUv).rgb;
-            // Cinematic tonemapping
-            fragColor = vec4(1.0 - exp(-c * 1.5), 1.0);
+            
+            // ACES Filmic Tonemapping for a cinematic, glowing aesthetic
+            c *= 1.2; 
+            vec3 mapped = (c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14);
+            
+            fragColor = vec4(mapped, 1.0);
         }`;
 
-        // --- Core Utilities ---
         function createProgram(vsSource, fsSource) {
             const compile = (type, source) => {
                 const shader = gl.createShader(type);
@@ -222,6 +224,7 @@
             gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
             gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
             gl.viewport(0, 0, w, h);
+            gl.clearColor(0,0,0,0);
             gl.clear(gl.COLOR_BUFFER_BIT);
             return { tex, fbo, width: w, height: h, attach: id => { gl.activeTexture(gl.TEXTURE0 + id); gl.bindTexture(gl.TEXTURE_2D, tex); return id; }};
         }
@@ -232,7 +235,6 @@
             return { get read() { return fbo1; }, get write() { return fbo2; }, swap() { let t = fbo1; fbo1 = fbo2; fbo2 = t; } };
         }
 
-        // --- Initialization ---
         const advectPrg = createProgram(baseVS, advectFS);
         const divergencePrg = createProgram(baseVS, divergenceFS);
         const jacobiPrg = createProgram(baseVS, jacobiFS);
@@ -251,18 +253,49 @@
         let lastTime = Date.now();
         let splats = [];
 
-        // --- Interaction ---
-        canvas.addEventListener('mousemove', e => {
-            splats.push({ x: e.clientX / canvas.width, y: 1.0 - e.clientY / canvas.height, dx: e.movementX, dy: -e.movementY, color: [Math.random()*0.5+0.5, Math.random()*0.5+0.5, Math.random()*0.5+0.5] });
+        // --- BULLETPROOF INPUT HANDLING WITH INTERPOLATION ---
+        const pointer = { x: 0, y: 0, dx: 0, dy: 0, moved: false, down: false, color: [0,0,0] };
+
+        function generateColor() {
+            // Generates deep, vibrant neon colors
+            let c = [Math.random() + 0.2, Math.random() + 0.2, Math.random() + 0.2];
+            let max = Math.max(c[0], Math.max(c[1], c[2]));
+            c[0] /= max; c[1] /= max; c[2] /= max;
+            return c;
+        }
+
+        canvas.addEventListener('mousedown', e => {
+            pointer.down = true; pointer.color = generateColor();
+            pointer.x = e.clientX; pointer.y = e.clientY;
         });
+        
+        canvas.addEventListener('mousemove', e => {
+            if(!pointer.down) return;
+            pointer.moved = true;
+            pointer.dx = e.clientX - pointer.x;
+            pointer.dy = e.clientY - pointer.y;
+            pointer.x = e.clientX; pointer.y = e.clientY;
+        });
+
+        window.addEventListener('mouseup', () => { pointer.down = false; });
+
+        canvas.addEventListener('touchstart', e => {
+            pointer.down = true; pointer.color = generateColor();
+            pointer.x = e.touches[0].clientX; pointer.y = e.touches[0].clientY;
+        }, {passive: true});
+
         canvas.addEventListener('touchmove', e => {
-            e.preventDefault(); // Prevents pulling the page around on mobile
+            e.preventDefault();
+            if(!pointer.down) return;
             const touch = e.touches[0];
-            splats.push({ x: touch.clientX / canvas.width, y: 1.0 - touch.clientY / canvas.height, dx: touch.clientX - (touch.lastX||touch.clientX), dy: -(touch.clientY - (touch.lastY||touch.clientY)), color: [Math.random()*0.5+0.5, Math.random()*0.5+0.5, Math.random()*0.5+0.5] });
-            touch.lastX = touch.clientX; touch.lastY = touch.clientY;
+            pointer.moved = true;
+            pointer.dx = touch.clientX - pointer.x;
+            pointer.dy = touch.clientY - pointer.y;
+            pointer.x = touch.clientX; pointer.y = touch.clientY;
         }, {passive: false});
 
-        // --- Render Loop ---
+        window.addEventListener('touchend', () => { pointer.down = false; });
+
         function render(prg, fbo) {
             gl.useProgram(prg.program);
             if (fbo) { gl.bindFramebuffer(gl.FRAMEBUFFER, fbo.fbo); gl.viewport(0, 0, fbo.width, fbo.height); } 
@@ -277,24 +310,43 @@
             gl.disable(gl.BLEND);
             gl.disable(gl.DEPTH_TEST);
 
-            // 1. Process Input Splats
+            if (pointer.moved) {
+                // Interpolate splats across the movement gap for a seamless line
+                const distance = Math.sqrt(pointer.dx * pointer.dx + pointer.dy * pointer.dy);
+                const steps = Math.max(1, Math.floor(distance / 5.0)); // Splat every 5 pixels
+                
+                for(let i = 0; i < steps; i++) {
+                    const percent = i / steps;
+                    const lerpX = (pointer.x - pointer.dx) + (pointer.dx * percent);
+                    const lerpY = (pointer.y - pointer.dy) + (pointer.dy * percent);
+                    
+                    splats.push({
+                        x: lerpX / canvas.width,
+                        y: 1.0 - (lerpY / canvas.height),
+                        dx: pointer.dx * 3.0,
+                        dy: -pointer.dy * 3.0,
+                        color: pointer.color
+                    });
+                }
+                pointer.moved = false;
+            }
+
             while(splats.length > 0) {
                 const s = splats.shift();
                 gl.useProgram(splatPrg.program);
                 gl.uniform1i(splatPrg.uniforms.uTarget, velocity.read.attach(0));
                 gl.uniform1f(splatPrg.uniforms.aspectRatio, canvas.width / canvas.height);
                 gl.uniform2f(splatPrg.uniforms.point, s.x, s.y);
-                gl.uniform3f(splatPrg.uniforms.color, s.dx * 10.0, s.dy * 10.0, 0.0);
-                gl.uniform1f(splatPrg.uniforms.radius, 0.002);
+                gl.uniform3f(splatPrg.uniforms.color, s.dx, s.dy, 0.0);
+                gl.uniform1f(splatPrg.uniforms.radius, 0.0015);
                 render(splatPrg, velocity.write); velocity.swap();
 
                 gl.uniform1i(splatPrg.uniforms.uTarget, density.read.attach(0));
                 gl.uniform3f(splatPrg.uniforms.color, s.color[0], s.color[1], s.color[2]);
-                gl.uniform1f(splatPrg.uniforms.radius, 0.001);
+                gl.uniform1f(splatPrg.uniforms.radius, 0.0015);
                 render(splatPrg, density.write); density.swap();
             }
 
-            // 2. Advect Velocity
             gl.useProgram(advectPrg.program);
             gl.uniform1i(advectPrg.uniforms.uVelocity, velocity.read.attach(0));
             gl.uniform1i(advectPrg.uniforms.uSource, velocity.read.attach(1));
@@ -303,14 +355,12 @@
             gl.uniform1f(advectPrg.uniforms.dissipation, 1.0);
             render(advectPrg, velocity.write); velocity.swap();
 
-            // 3. Advect Density (Dye)
             gl.uniform1i(advectPrg.uniforms.uVelocity, velocity.read.attach(0));
             gl.uniform1i(advectPrg.uniforms.uSource, density.read.attach(1));
             gl.uniform2f(advectPrg.uniforms.texelSize, 1.0 / DYE_RES, 1.0 / DYE_RES);
             gl.uniform1f(advectPrg.uniforms.dissipation, DISSIPATION);
             render(advectPrg, density.write); density.swap();
 
-            // 4. Vorticity Confinement
             gl.useProgram(vortPrg.program);
             gl.uniform1i(vortPrg.uniforms.uVelocity, velocity.read.attach(0));
             gl.uniform2f(vortPrg.uniforms.texelSize, 1.0 / SIM_RES, 1.0 / SIM_RES);
@@ -324,7 +374,6 @@
             gl.uniform1f(vortConfPrg.uniforms.dt, dt);
             render(vortConfPrg, velocity.write); velocity.swap();
 
-            // 5. Viscosity (Jacobi iterations on Velocity)
             if (VISCOSITY > 0) {
                 gl.useProgram(jacobiPrg.program);
                 const alpha = (1.0 / (SIM_RES * SIM_RES)) / (VISCOSITY * dt);
@@ -333,22 +382,19 @@
                 gl.uniform2f(jacobiPrg.uniforms.texelSize, 1.0 / SIM_RES, 1.0 / SIM_RES);
                 for (let i = 0; i < 10; i++) {
                     gl.uniform1i(jacobiPrg.uniforms.uPressure, velocity.read.attach(0));
-                    gl.uniform1i(jacobiPrg.uniforms.uDivergence, velocity.read.attach(1)); // Using self as source
+                    gl.uniform1i(jacobiPrg.uniforms.uDivergence, velocity.read.attach(1)); 
                     render(jacobiPrg, velocity.write); velocity.swap();
                 }
             }
 
-            // 6. Divergence
             gl.useProgram(divergencePrg.program);
             gl.uniform1i(divergencePrg.uniforms.uVelocity, velocity.read.attach(0));
             gl.uniform2f(divergencePrg.uniforms.texelSize, 1.0 / SIM_RES, 1.0 / SIM_RES);
             render(divergencePrg, divergence);
 
-            // 7. Clear Pressure
             gl.bindFramebuffer(gl.FRAMEBUFFER, pressure.read.fbo);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
-            // 8. Pressure Solver (Jacobi)
             gl.useProgram(jacobiPrg.program);
             gl.uniform1i(jacobiPrg.uniforms.uDivergence, divergence.attach(1));
             gl.uniform2f(jacobiPrg.uniforms.texelSize, 1.0 / SIM_RES, 1.0 / SIM_RES);
@@ -359,14 +405,12 @@
                 render(jacobiPrg, pressure.write); pressure.swap();
             }
 
-            // 9. Gradient Subtraction
             gl.useProgram(gradSubPrg.program);
             gl.uniform1i(gradSubPrg.uniforms.uPressure, pressure.read.attach(0));
             gl.uniform1i(gradSubPrg.uniforms.uVelocity, velocity.read.attach(1));
             gl.uniform2f(gradSubPrg.uniforms.texelSize, 1.0 / SIM_RES, 1.0 / SIM_RES);
             render(gradSubPrg, velocity.write); velocity.swap();
 
-            // 10. Display
             gl.useProgram(displayPrg.program);
             gl.uniform1i(displayPrg.uniforms.uTexture, density.read.attach(0));
             render(displayPrg, null);
